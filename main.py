@@ -1,12 +1,16 @@
 import argparse
 import base64
+import os
 import socket
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 import pynmea2
 import serial
+from flask import Flask, jsonify, render_template
 from serial import SerialException
 
 FIX_QUALITY = {
@@ -20,6 +24,22 @@ FIX_QUALITY = {
     7: "Manual",
     8: "Simulation",
 }
+
+
+@dataclass
+class Position:
+    lat: float = 0.0
+    lon: float = 0.0
+    alt: Optional[float] = None
+    fix: str = "No Fix"
+    fix_code: int = 0
+    sats: int = 0
+    hdop: Optional[float] = None
+    timestamp: float = 0.0
+
+
+position = Position()
+position_lock = threading.Lock()
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ntrip-pass", default="rtk2go", help="NTRIP password (if required)")
     parser.add_argument(
         "--no-ntrip", action="store_true", help="Disable NTRIP corrections (standalone mode)"
+    )
+    parser.add_argument(
+        "--web", action="store_true", help="Start web UI"
+    )
+    parser.add_argument(
+        "--web-port", type=int, default=5000, help="Port for web UI (default: 5000)"
     )
     return parser.parse_args()
 
@@ -164,6 +190,35 @@ def format_coord(degrees: float, hemi: str) -> str:
     return f"{degrees!r}"
 
 
+def create_app() -> Flask:
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"),
+    )
+
+    @app.route("/")
+    def index():
+        return render_template("map.html")
+
+    @app.route("/api/position")
+    def get_position():
+        with position_lock:
+            return jsonify(
+                {
+                    "lat": position.lat,
+                    "lon": position.lon,
+                    "alt": position.alt,
+                    "fix": position.fix,
+                    "fix_code": position.fix_code,
+                    "sats": position.sats,
+                    "hdop": position.hdop,
+                    "timestamp": position.timestamp,
+                }
+            )
+
+    return app
+
+
 def main() -> None:
     args = parse_args()
     ser = connect_serial(args.port, args.baud, args.retry_delay)
@@ -187,6 +242,16 @@ def main() -> None:
             daemon=True,
         )
         ntrip_thread.start()
+
+    if args.web:
+        app = create_app()
+        web_thread = threading.Thread(
+            target=app.run,
+            kwargs={"host": "0.0.0.0", "port": args.web_port, "debug": False, "use_reloader": False},
+            daemon=True,
+        )
+        web_thread.start()
+        print(f"Web UI at http://localhost:{args.web_port}", flush=True)
 
     print("Waiting for GPS fix... (Ctrl+C to quit)", flush=True)
 
@@ -222,6 +287,16 @@ def main() -> None:
                     end="",
                     flush=True,
                 )
+
+                with position_lock:
+                    position.lat = msg.latitude
+                    position.lon = msg.longitude
+                    position.alt = msg.altitude
+                    position.fix = fix
+                    position.fix_code = msg.gps_qual
+                    position.sats = int(msg.num_sats) if msg.num_sats else 0
+                    position.hdop = float(msg.horizontal_dil) if msg.horizontal_dil else None
+                    position.timestamp = time.time()
 
             except pynmea2.ParseError:
                 continue
