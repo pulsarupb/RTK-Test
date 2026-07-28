@@ -1,5 +1,8 @@
 import argparse
+import base64
+import socket
 import sys
+import threading
 import time
 
 import pynmea2
@@ -20,7 +23,7 @@ FIX_QUALITY = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RTK GPS reader")
+    parser = argparse.ArgumentParser(description="RTK GPS reader with NTRIP corrections")
     parser.add_argument("--port", default="/dev/ttyACM0", help="Serial port")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
     parser.add_argument(
@@ -28,6 +31,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=3.0,
         help="Seconds between reconnect attempts",
+    )
+    parser.add_argument("--ntrip-host", default="rtk2go.com", help="NTRIP caster host")
+    parser.add_argument("--ntrip-port", type=int, default=2101, help="NTRIP caster port")
+    parser.add_argument("--mount-point", default="SemaAgoraRobotics", help="NTRIP mount point")
+    parser.add_argument("--ntrip-user", default=None, help="NTRIP username (if required)")
+    parser.add_argument("--ntrip-pass", default=None, help="NTRIP password (if required)")
+    parser.add_argument(
+        "--no-ntrip", action="store_true", help="Disable NTRIP corrections (standalone mode)"
     )
     return parser.parse_args()
 
@@ -46,6 +57,97 @@ def connect_serial(port: str, baud: int, retry_delay: float) -> serial.Serial:
             time.sleep(retry_delay)
 
 
+def connect_ntrip(
+    host: str,
+    port: int,
+    mount_point: str,
+    user: str | None,
+    passwd: str | None,
+    retry_delay: float,
+) -> tuple[socket.socket, bytes]:
+    while True:
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            sock.settimeout(5)
+
+            request = f"GET /{mount_point} HTTP/1.0\r\n"
+            request += f"Host: {host}\r\n"
+            request += "User-Agent: NTRIP rtk-test/0.1.0\r\n"
+            request += "Accept: */*\r\n"
+            if user is not None and passwd is not None:
+                creds = base64.b64encode(f"{user}:{passwd}".encode()).decode()
+                request += f"Authorization: Basic {creds}\r\n"
+            request += "\r\n"
+
+            sock.sendall(request.encode())
+
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("NTRIP connection closed during handshake")
+                buf += chunk
+
+            header = buf.split(b"\r\n\r\n")[0].decode(errors="replace")
+            status_line = header.split("\r\n")[0]
+            if "200" not in status_line:
+                print(f"NTRIP warning: {status_line}", flush=True)
+
+            _, _, remainder = buf.partition(b"\r\n\r\n")
+            print(
+                f"NTRIP connected to {mount_point} @ {host}:{port}",
+                flush=True,
+            )
+            return sock, remainder
+
+        except (socket.timeout, ConnectionError, OSError) as e:
+            print(
+                f"NTRIP connection failed ({e}). Retrying in {retry_delay}s...",
+                flush=True,
+            )
+            time.sleep(retry_delay)
+
+
+def ntrip_forwarder(
+    ser_ref: list[serial.Serial],
+    host: str,
+    port: int,
+    mount_point: str,
+    user: str | None,
+    passwd: str | None,
+    retry_delay: float,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            sock, remainder = connect_ntrip(
+                host, port, mount_point, user, passwd, retry_delay
+            )
+            if remainder:
+                ser_ref[0].write(remainder)
+
+            while not stop_event.is_set():
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("NTRIP connection closed")
+                    ser_ref[0].write(chunk)
+                except socket.timeout:
+                    continue
+        except (ConnectionError, OSError, SerialException) as e:
+            if not stop_event.is_set():
+                print(
+                    f"\nNTRIP error ({e}). Reconnecting in {retry_delay}s...",
+                    flush=True,
+                )
+                time.sleep(retry_delay)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 def format_coord(degrees: float, hemi: str) -> str:
     if hemi in ("S", "W"):
         return f"-{degrees:.6f}"
@@ -55,6 +157,26 @@ def format_coord(degrees: float, hemi: str) -> str:
 def main() -> None:
     args = parse_args()
     ser = connect_serial(args.port, args.baud, args.retry_delay)
+    ser_ref: list[serial.Serial] = [ser]
+    stop_event = threading.Event()
+    ntrip_thread: threading.Thread | None = None
+
+    if not args.no_ntrip:
+        ntrip_thread = threading.Thread(
+            target=ntrip_forwarder,
+            args=(
+                ser_ref,
+                args.ntrip_host,
+                args.ntrip_port,
+                args.mount_point,
+                args.ntrip_user,
+                args.ntrip_pass,
+                args.retry_delay,
+                stop_event,
+            ),
+            daemon=True,
+        )
+        ntrip_thread.start()
 
     print("Waiting for GPS fix... (Ctrl+C to quit)", flush=True)
 
@@ -95,12 +217,16 @@ def main() -> None:
                 print("\nSerial connection lost. Reconnecting...", flush=True)
                 ser.close()
                 ser = connect_serial(args.port, args.baud, args.retry_delay)
+                ser_ref[0] = ser
             except UnicodeDecodeError:
                 continue
 
     except KeyboardInterrupt:
         print("\nExiting.", flush=True)
     finally:
+        stop_event.set()
+        if ntrip_thread and ntrip_thread.is_alive():
+            ntrip_thread.join(timeout=3)
         if ser.is_open:
             ser.close()
 
