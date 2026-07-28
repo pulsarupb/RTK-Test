@@ -160,8 +160,8 @@ def ntrip_forwarder(
 
 def format_coord(degrees: float, hemi: str) -> str:
     if hemi in ("S", "W"):
-        return f"-{degrees:.6f}"
-    return f"{degrees:.6f}"
+        return f"-{degrees!r}"
+    return f"{degrees!r}"
 
 
 def main() -> None:
@@ -210,10 +210,12 @@ def main() -> None:
                 alt = f"{msg.altitude:.1f}" if msg.altitude else "N/A"
                 fix = FIX_QUALITY.get(msg.gps_qual, f"Unknown ({msg.gps_qual})")
                 sats = msg.num_sats
+                hacc = f"{float(msg.horizontal_dil):.1f}" if msg.horizontal_dil else "N/A"
 
                 print(
                     f"\r[{lat}, {lon}]  "
                     f"Alt: {alt} m  "
+                    f"HACC: {hacc}  "
                     f"Fix: {fix}  "
                     f"Sats: {sats}  "
                     f"(Ctrl+C to quit)   ",
