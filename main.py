@@ -35,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ntrip-host", default="rtk2go.com", help="NTRIP caster host")
     parser.add_argument("--ntrip-port", type=int, default=2101, help="NTRIP caster port")
     parser.add_argument("--mount-point", default="SemaAgoraRobotics", help="NTRIP mount point")
-    parser.add_argument("--ntrip-user", default=None, help="NTRIP username (if required)")
-    parser.add_argument("--ntrip-pass", default=None, help="NTRIP password (if required)")
+    parser.add_argument("--ntrip-user", default="rtk2go@rtk2go.com", help="NTRIP username (if required)")
+    parser.add_argument("--ntrip-pass", default="rtk2go", help="NTRIP password (if required)")
     parser.add_argument(
         "--no-ntrip", action="store_true", help="Disable NTRIP corrections (standalone mode)"
     )
@@ -73,7 +73,6 @@ def connect_ntrip(
             request = f"GET /{mount_point} HTTP/1.0\r\n"
             request += f"Host: {host}\r\n"
             request += "User-Agent: NTRIP rtk-test/0.1.0\r\n"
-            request += "Accept: */*\r\n"
             if user is not None and passwd is not None:
                 creds = base64.b64encode(f"{user}:{passwd}".encode()).decode()
                 request += f"Authorization: Basic {creds}\r\n"
@@ -82,23 +81,34 @@ def connect_ntrip(
             sock.sendall(request.encode())
 
             buf = b""
-            while b"\r\n\r\n" not in buf:
+            while True:
                 chunk = sock.recv(4096)
                 if not chunk:
                     raise ConnectionError("NTRIP connection closed during handshake")
                 buf += chunk
+                if b"\r\n" not in buf:
+                    continue
+                status_line = buf.split(b"\r\n", 1)[0].decode(errors="replace")
 
-            header = buf.split(b"\r\n\r\n")[0].decode(errors="replace")
-            status_line = header.split("\r\n")[0]
-            if "200" not in status_line:
-                print(f"NTRIP warning: {status_line}", flush=True)
+                if status_line.startswith("SOURCETABLE"):
+                    raise ConnectionError(
+                        f"Mount point '{mount_point}' not found (got source table)"
+                    )
+                if "200" not in status_line:
+                    print(f"NTRIP warning: {status_line}", flush=True)
+                    raise ConnectionError(f"Bad NTRIP response: {status_line}")
 
-            _, _, remainder = buf.partition(b"\r\n\r\n")
-            print(
-                f"NTRIP connected to {mount_point} @ {host}:{port}",
-                flush=True,
-            )
-            return sock, remainder
+                if status_line.startswith("ICY"):
+                    _, _, remainder = buf.partition(b"\r\n")
+                elif b"\r\n\r\n" in buf:
+                    _, _, remainder = buf.partition(b"\r\n\r\n")
+                else:
+                    continue
+                print(
+                    f"NTRIP connected to {mount_point} @ {host}:{port}",
+                    flush=True,
+                )
+                return sock, remainder
 
         except (socket.timeout, ConnectionError, OSError) as e:
             print(
